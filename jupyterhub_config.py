@@ -1,109 +1,173 @@
 import os
+import string
+import escapism
 
-# Helper functions for doing conversions or translations if needed.
+# Enable JupyterLab interface if enabled.
 
-def convert_size_to_bytes(size):
-    multipliers = {
-        'k': 1000,
-        'm': 1000**2,
-        'g': 1000**3,
-        't': 1000**4,
-        'ki': 1024,
-        'mi': 1024**2,
-        'gi': 1024**3,
-        'ti': 1024**4,
+if os.environ.get('JUPYTERHUB_ENABLE_LAB', 'false').lower() in ['true', 'yes', 'y', '1']:
+    c.Spawner.environment = dict(JUPYTER_ENABLE_LAB='true')
+
+# Setup location for customised template files.
+
+c.JupyterHub.template_paths = ['/opt/app-root/src/templates']
+
+# Setup configuration for authenticating using LDAP. In this case we
+# need to deal with separate LDAP servers based on the domain name so
+# we need to provide a custom authenticator which can delegate to the
+# respective LDAP authenticator instance for the domain.
+
+from ldapauthenticator import LDAPAuthenticator
+
+c.LDAPAuthenticator.use_ssl = False
+c.LDAPAuthenticator.lookup_dn = True
+c.LDAPAuthenticator.lookup_dn_search_filter = '({login_attr}={login})'
+c.LDAPAuthenticator.escape_userdn = False
+c.LDAPAuthenticator.valid_username_regex = '^[A-Za-z0-9\\\._-]{7,}$'
+c.LDAPAuthenticator.user_attribute = 'sAMAccountName'
+c.LDAPAuthenticator.lookup_dn_user_dn_attribute = 'sAMAccountName'
+c.LDAPAuthenticator.escape_userdn = False
+
+c.LDAPAuthenticator.lookup_dn_search_user = "siddu"
+c.LDAPAuthenticator.lookup_dn_search_password = "openshift"
+
+student_authenticator = LDAPAuthenticator()
+student_authenticator.server_address = '104.211.78.90'
+student_authenticator.bind_dn_template = ['pdcloudex\\{username}']
+student_authenticator.user_search_base = 'DC=pdcloudex,DC=com'
+
+#staff_authenticator = LDAPAuthenticator()
+#staff_authenticator.server_address = 'staff.main.ntu.edu.sg'
+#staff_authenticator.bind_dn_template = ['staff\\{username}']
+#staff_authenticator.user_search_base = 'DC=staff,DC=main,DC=ntu,DC=edu,DC=sg'
+
+#assoc_authenticator = LDAPAuthenticator()
+#assoc_authenticator.server_address = 'assoc.main.ntu.edu.sg'
+#assoc_authenticator.bind_dn_template = ['assoc\\{username}']
+#assoc_authenticator.user_search_base = 'DC=assoc,DC=main,DC=ntu,DC=edu,DC=sg'
+
+from jupyterhub.auth import Authenticator
+
+class MultiLDAPAuthenticator(Authenticator):
+
+    def authenticate(self, handler, data):
+        domain = data['domain'].lower()
+
+        data['username'] = data['username'].lower()
+
+        if domain == 'pdcloudex':
+            return student_authenticator.authenticate(handler, data)
+        elif domain == 'staff':
+            return staff_authenticator.authenticate(handler, data)
+        elif domain == 'assoc':
+            return assoc_authenticator.authenticate(handler, data)
+
+        self.log.warn('domain:%s Unknown authentication domain name', domain)
+        return None
+
+c.JupyterHub.authenticator_class = MultiLDAPAuthenticator
+
+if os.path.exists('/opt/app-root/configs/admin_users.txt'):
+    with open('/opt/app-root/configs/admin_users.txt') as fp:
+        content = fp.read().strip()
+        if content:
+            c.Authenticator.admin_users = set(content.split())
+
+if os.path.exists('/opt/app-root/configs/user_whitelist.txt'):
+    with open('/opt/app-root/configs/user_whitelist.txt') as fp:
+        c.Authenticator.whitelist = set(fp.read().strip().split())
+
+# Provide persistent storage for users notebooks. We share one
+# persistent volume for all users, mounting just their subdirectory into
+# their pod. The persistent volume type needs to be ReadWriteMany so it
+# can be mounted on multiple nodes as can't control where pods for a
+# user may land. Because it is a shared volume, there are no quota
+# restrictions which prevent a specific user filling up the entire
+# persistent volume.
+
+c.KubeSpawner.user_storage_pvc_ensure = False
+c.KubeSpawner.pvc_name_template = '%s-notebooks-pvc' % c.KubeSpawner.hub_connect_ip
+
+c.KubeSpawner.volumes = [
+    {
+        'name': 'notebooks',
+        'persistentVolumeClaim': {
+            'claimName': c.KubeSpawner.pvc_name_template
+        }
     }
+]
 
-    size = str(size)
+volume_mounts_user = [
+    {
+        'name': 'notebooks',
+        'mountPath': '/opt/app-root/src',
+        'subPath': 'users/{username}'
+    }
+]
 
-    for suffix in multipliers:
-        if size.lower().endswith(suffix):
-            return int(size[0:-len(suffix)]) * multipliers[suffix]
+volume_mounts_admin = [
+    {
+        'name': 'notebooks',
+        'mountPath': '/opt/app-root/src/users',
+        'subPath': 'users'
+    }
+]
+
+def interpolate_properties(spawner, template):
+    safe_chars = set(string.ascii_lowercase + string.digits)
+    username = escapism.escape(spawner.user.name, safe=safe_chars,
+            escape_char='-').lower()
+
+    return template.format(
+        userid=spawner.user.id,
+        username=username)
+
+def expand_strings(spawner, src):
+    if isinstance(src, list):
+        return [expand_strings(spawner, i) for i in src]
+    elif isinstance(src, dict):
+        return {k: expand_strings(spawner, v) for k, v in src.items()}
+    elif isinstance(src, str):
+        return interpolate_properties(spawner, src)
     else:
-        if size.lower().endswith('b'):
-            return int(size[0:-1])
+        return src
 
-    try:
-        return int(size)
-    except ValueError:
-        raise RuntimeError('"%s" is not a valid memory specification. Must be an integer or a string with suffix K, M, G, T, Ki, Mi, Gi or Ti.' % size)
+def modify_pod_hook(spawner, pod):
+    if spawner.user.admin:
+        volume_mounts = volume_mounts_admin
+        workspace = interpolate_properties(spawner, 'users/{username}/workspace')
+    else:
+        volume_mounts = volume_mounts_user
+        workspace = 'workspace'
 
-# Define the default configuration for JupyterHub application.
+    os.makedirs(interpolate_properties(spawner,
+            '/opt/app-root/notebooks/users/{username}'), exist_ok=True)
 
-service_name = os.environ.get('JUPYTERHUB_SERVICE_NAME', 'jupyterhub')
+    pod.spec.containers[0].env.append(dict(name='JUPYTER_MASTER_FILES',
+            value='/opt/app-root/master'))
+    pod.spec.containers[0].env.append(dict(name='JUPYTER_WORKSPACE_NAME',
+            value=workspace))
 
-c.JupyterHub.port = 8080
+    pod.spec.containers[0].volume_mounts.extend(
+            expand_strings(spawner, volume_mounts))
 
-c.JupyterHub.hub_ip = '0.0.0.0'
-c.JupyterHub.hub_port = 8081
+    return pod
 
-c.JupyterHub.proxy_api_port = 8082
+c.KubeSpawner.modify_pod_hook = modify_pod_hook
 
-c.Spawner.start_timeout = 120
-c.Spawner.http_timeout = 60
+# Setup culling of idle notebooks if timeout parameter is supplied.
 
-c.KubeSpawner.port = 8080
+idle_timeout = os.environ.get('JUPYTERHUB_IDLE_TIMEOUT')
 
-c.KubeSpawner.hub_connect_ip = service_name
-c.KubeSpawner.hub_connect_port = 8080
-
-# JupyterHub < 0.9.
-c.KubeSpawner.singleuser_extra_labels = { 'app': service_name }
-
-# JupyterHub >= 0.9.
-c.KubeSpawner.common_labels = { 'app': service_name }
-
-c.KubeSpawner.singleuser_uid = os.getuid()
-c.KubeSpawner.singleuser_fs_gid = os.getuid()
-
-c.KubeSpawner.singleuser_extra_annotations = {
-    "alpha.image.policy.openshift.io/resolve-names": "*"
-}
-
-c.KubeSpawner.cmd = ['start-singleuser.sh']
-
-c.KubeSpawner.args = ['--hub-api-url=http://%s:%d/hub/api' % (
-        c.KubeSpawner.hub_connect_ip, c.KubeSpawner.hub_connect_port)]
-
-c.KubeSpawner.pod_name_template = '%s-nb-{username}' % c.KubeSpawner.hub_connect_ip
-
-c.JupyterHub.admin_access = True
-
-if os.environ.get('JUPYTERHUB_COOKIE_SECRET'):
-    c.JupyterHub.cookie_secret = os.environ[
-            'JUPYTERHUB_COOKIE_SECRET'].encode('UTF-8')
-else:
-    c.JupyterHub.cookie_secret_file = '/opt/app-root/data/cookie_secret'
-
-if os.environ.get('JUPYTERHUB_DATABASE_PASSWORD'):
-    c.JupyterHub.db_url = 'postgresql://jupyterhub:%s@%s:5432/jupyterhub' % (
-            os.environ['JUPYTERHUB_DATABASE_PASSWORD'],
-            os.environ['JUPYTERHUB_DATABASE_HOST'])
-else:
-    c.JupyterHub.db_url = '/opt/app-root/data/database.sqlite'
-
-c.JupyterHub.authenticator_class = 'tmpauthenticator.TmpAuthenticator'
-
-c.JupyterHub.spawner_class = 'kubespawner.KubeSpawner'
-
-c.KubeSpawner.singleuser_image_spec = os.environ.get('JUPYTERHUB_NOTEBOOK_IMAGE',
-        's2i-minimal-notebook:3.5')
-
-if os.environ.get('JUPYTERHUB_NOTEBOOK_MEMORY'):
-    c.Spawner.mem_limit = convert_size_to_bytes(os.environ['JUPYTERHUB_NOTEBOOK_MEMORY'])
-
-# Load configuration included in the image.
-
-image_config_file = '/opt/app-root/src/.jupyter/jupyterhub_config.py'
-
-if os.path.exists(image_config_file):
-    with open(image_config_file) as fp:
-        exec(compile(fp.read(), image_config_file, 'exec'), globals())
-
-# Load configuration provided via the environment.
-
-environ_config_file = '/opt/app-root/configs/jupyterhub_config.py'
-
-if os.path.exists(environ_config_file):
-    with open(environ_config_file) as fp:
-        exec(compile(fp.read(), environ_config_file, 'exec'), globals())
+if idle_timeout and int(idle_timeout):
+    c.JupyterHub.services = [
+        {
+            'name': 'cull-idle',
+            'admin': True,
+            'command': ['cull-idle-servers', '--timeout=%s' % idle_timeout],
+        },
+        {
+            'name': 'backup-users',
+            'admin': True,
+            'command': ['backup-user-details', '--backups=/opt/app-root/notebooks/backups'],
+        }
+]
