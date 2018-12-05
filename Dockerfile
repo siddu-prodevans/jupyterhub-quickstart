@@ -1,4 +1,4 @@
-FROM centos/python-35-centos7:latest
+FROM rhscl/python-35-rhel7:3.5-39
 
 LABEL io.k8s.display-name="JupyterHub" \
       io.k8s.description="JupyterHub." \
