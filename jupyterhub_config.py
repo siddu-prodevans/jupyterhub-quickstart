@@ -27,11 +27,11 @@ c.LDAPAuthenticator.user_attribute = 'sAMAccountName'
 c.LDAPAuthenticator.lookup_dn_user_dn_attribute = 'sAMAccountName'
 c.LDAPAuthenticator.escape_userdn = False
 
-c.LDAPAuthenticator.lookup_dn_search_user = "siddu"
-c.LDAPAuthenticator.lookup_dn_search_password = "openshift"
+c.LDAPAuthenticator.lookup_dn_search_user = "ldapuser1"
+c.LDAPAuthenticator.lookup_dn_search_password = "redhat"
 
 student_authenticator = LDAPAuthenticator()
-student_authenticator.server_address = '104.211.78.90'
+student_authenticator.server_address = '10.10.122.192'
 student_authenticator.bind_dn_template = ['pdcloudex\\{username}']
 student_authenticator.user_search_base = 'DC=pdcloudex,DC=com'
 
