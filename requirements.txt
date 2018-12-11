@@ -6,3 +6,10 @@ jupyterhub-tmpauthenticator==0.5
 git+https://github.com/jupyterhub/oauthenticator.git@75d8b9b5ee366e7094d28a4c569986f04e3ea802
 jupyterhub-ldapauthenticator==1.2.1
 psycopg2==2.7.4
+numpy
+scipy
+pandas
+seaborn
+matplotlib
+plotly
+pyspark
